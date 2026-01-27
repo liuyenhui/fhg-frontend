@@ -1,0 +1,173 @@
+name: Publish Frontend Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional semantic version (prefixed with v) for manual release'
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/fhg-frontend
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/fhg-frontend
+      CHARTS_TOKEN: ${{ secrets.CHARTS_REPO_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manual_version="${{ github.event.inputs.version || '' }}"
+          if [[ -n "$manual_version" ]]; then
+            if [[ ! "$manual_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Manual version must follow vMAJOR.MINOR.PATCH" >&2
+              exit 1
+            fi
+            version="$manual_version"
+          else
+            git fetch --tags
+            latest=$(git tag --list 'v*' | sort -V | tail -n1)
+            if [[ -z "$latest" ]]; then
+              version="v0.0.1"
+            else
+              if [[ "$latest" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                major=${BASH_REMATCH[1]}
+                minor=${BASH_REMATCH[2]}
+                patch=${BASH_REMATCH[3]}
+                if (( patch >= 99 )); then
+                  major=$((major + 1))
+                  minor=0
+                  patch=0
+                else
+                  patch=$((patch + 1))
+                fi
+                version="v$major.$minor.$patch"
+              else
+                echo "Latest tag ($latest) does not follow vMAJOR.MINOR.PATCH" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "Determined release version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Push Git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          version="${{ steps.version.outputs.version }}"
+          if git rev-parse "$version" >/dev/null 2>&1; then
+            echo "Tag $version already exists, skipping creation."
+          else
+            git tag "$version"
+          fi
+          git push origin "$version"
+
+      - name: Trigger fhg-charts packaging
+        run: |
+          set -euo pipefail
+          export IMAGE_TAG="${{ steps.version.outputs.version }}"
+          if [[ -z "${CHARTS_TOKEN:-}" ]]; then
+            echo "CHARTS_REPO_TOKEN missing; skipping chart dispatch."
+            exit 0
+          fi
+          branch="${GITHUB_REF#refs/heads/}"
+          commit_message="$(git log -1 --pretty=%s)"
+          source_repo="${{ github.repository }}"
+          source_commit="${GITHUB_SHA}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          source_actor="${{ github.actor }}"
+
+          export SOURCE_BRANCH="${branch}"
+          export SOURCE_REPO="${source_repo}"
+          export SOURCE_COMMIT="${source_commit}"
+          export COMMIT_MESSAGE="${commit_message}"
+          export SOURCE_ACTOR="${source_actor}"
+          export SOURCE_RUN_URL="${run_url}"
+
+          echo "Dispatching chart packaging for tag ${IMAGE_TAG} from ${source_repo}@${branch}"
+          payload=$(python - <<'PY'
+          import json, os
+
+          payload = {
+              "event_type": "package-chart",
+              "client_payload": {
+                  "chart": "fhg-frontend-chart",
+                  "imageTag": os.environ["IMAGE_TAG"],
+                  "sourceRepo": os.environ["SOURCE_REPO"],
+                  "sourceBranch": os.environ["SOURCE_BRANCH"],
+                  "sourceCommit": os.environ["SOURCE_COMMIT"],
+                  "commitMessage": os.environ["COMMIT_MESSAGE"],
+                  "sourceActor": os.environ["SOURCE_ACTOR"],
+                  "sourceRunUrl": os.environ["SOURCE_RUN_URL"],
+              },
+          }
+
+          print(json.dumps(payload))
+          PY
+          )
+          echo "::notice ::Payload: ${payload}"
+          status=$(curl -s -o /tmp/dispatch.out -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${CHARTS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/liuyenhui/fhg-charts/dispatches \
+            -d "$payload")
+          echo "::notice ::Dispatch HTTP ${status}"
+          if [[ "$status" -ge 300 ]]; then
+            cat /tmp/dispatch.out
+            echo "Dispatch to fhg-charts failed with HTTP ${status}"
+            exit 1
+          fi
